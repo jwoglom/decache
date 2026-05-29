@@ -1,7 +1,27 @@
+# Build / packaging output
 /Releases
 /Decache Exporter
 /Verified
 /Unverified
 *.zip
-*.py
-*.txt
+
+# Data dir: track the database + auxiliary inputs + README, ignore anything
+# else (runtime-generated files) that lands there.
+/bin/data/*
+!/bin/data/video_data.txt
+!/bin/data/watch_page_data.txt
+!/bin/data/unique_names.txt
+!/bin/data/history_data.txt
+!/bin/data/asset_data.txt
+!/bin/data/README.md
+/bin/history/temp/
+/bin/private_locations.txt
+/bin/cached_ids.txt
+
+# Compiled native helper and scratch files
+/bin/phash
+/bin/frames.raw
+
+# Python
+__pycache__/
+*.pyc

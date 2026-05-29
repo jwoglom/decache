@@ -9,6 +9,8 @@
 #include <vector>
 #include <cmath>
 #include <stdint.h>
+#include <cstdio>
+#include <cstring>
 
 const int WIDTH = 32;
 const int HEIGHT = 32;

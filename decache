@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Decache launcher (Linux / macOS).
+#
+# Thin wrapper around decache.py so the tool can be run as `./decache [PATH]`,
+# mirroring the old `start_decache.bat`. Compiles the phash helper on first run
+# if it is missing.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Pick a Python 3 interpreter.
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "error: python 3 is required but was not found on PATH." >&2
+  exit 1
+fi
+
+# Build the native phash helper on first run if absent and a compiler exists.
+if [[ ! -x "$HERE/bin/phash" ]]; then
+  if command -v g++ >/dev/null 2>&1 || command -v c++ >/dev/null 2>&1; then
+    echo "phash helper not built yet; compiling..." >&2
+    "$HERE/build.sh" || echo "warning: phash build failed; frame matching disabled." >&2
+  else
+    echo "warning: no C++ compiler found; phash frame matching will be disabled." >&2
+  fi
+fi
+
+# ffmpeg check (native dependency).
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "warning: ffmpeg not found on PATH; install it (e.g. 'apt install ffmpeg')." >&2
+fi
+
+exec "$PY" "$HERE/decache.py" "$@"
