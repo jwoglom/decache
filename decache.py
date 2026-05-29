@@ -190,12 +190,8 @@ def write_credit_and_finish(paths: Paths, cached_ids: set) -> None:
                       "  https://sindexmon.github.io/decache/")
 
 
-def resolve_targets(path_arg: Optional[str]) -> List[str]:
-    if not path_arg:
-        chosen = ui.prompt_folder(
-            "Select a computer/backup to scan. The running computer is usually "
-            "mounted at '/'; a backup's location varies.")
-        return [chosen] if chosen else []
+def _resolve_one(path_arg: str) -> List[str]:
+    """Resolve a single argument: a directory, or a file listing directories."""
     if os.path.isdir(path_arg):
         return [path_arg]
     if os.path.isfile(path_arg):
@@ -212,6 +208,28 @@ def resolve_targets(path_arg: Optional[str]) -> List[str]:
         return targets
     log.error("path does not exist: %s", path_arg)
     return []
+
+
+def resolve_targets(path_args: List[str]) -> List[str]:
+    """Resolve every argument; each may be a directory or a list-file.
+
+    Multiple folders can be passed and are all scanned. Order is preserved and
+    duplicates are removed.
+    """
+    if not path_args:
+        chosen = ui.prompt_folder(
+            "Select a computer/backup to scan. The running computer is usually "
+            "mounted at '/'; a backup's location varies.")
+        return [chosen] if chosen else []
+    targets: List[str] = []
+    seen = set()
+    for arg in path_args:
+        for t in _resolve_one(arg):
+            key = os.path.abspath(t)
+            if key not in seen:
+                seen.add(key)
+                targets.append(t)
+    return targets
 
 
 def normalize_legacy_args(argv: List[str]) -> List[str]:
@@ -236,8 +254,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="decache", description="Scan a backup for cached lost media.")
-    parser.add_argument("path", nargs="?", help="directory to scan, or a text "
-                        "file listing directories (one per line)")
+    parser.add_argument("path", nargs="*", help="one or more directories to "
+                        "scan, and/or text files listing directories (one per "
+                        "line); all are processed")
     parser.add_argument("--keep-all", action="store_true",
                         help="keep all candidate videos even if unmatched")
     parser.add_argument("--silence", type=int, choices=(1, 2), default=0,
