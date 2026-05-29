@@ -13,7 +13,9 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Dict, Optional
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional
 
 from . import magic, packaging
 from .cache_common import CacheEntry
@@ -49,6 +51,15 @@ def suggested_name(entry: CacheEntry) -> str:
     return "video"
 
 
+def _sniff(path: str):
+    """Classify a file by its leading bytes (for picking an extension)."""
+    try:
+        with open(path, "rb") as fh:
+            return magic.classify(fh.read(magic.HEADER_BYTES))
+    except OSError:
+        return magic.Kind.OTHER
+
+
 class Reassembler:
     def __init__(self, verifier: Verifier, verified_dir: str, unverified_dir: str,
                  keep_all: bool):
@@ -61,6 +72,10 @@ class Reassembler:
         self.pending_mp4: Optional[str] = None
         self._meta: Dict[str, dict] = {}
         self.stats = {"verified": 0, "likely": 0, "unverified": 0, "discarded": 0}
+        # Completed candidate files awaiting (parallel) verification.
+        # Each: {"path", "meta", "owns"} — owns=True means we created the file
+        # (move/delete freely); owns=False is a loose backup file (copy only).
+        self.completed: List[dict] = []
 
     # -- low-level file ops ------------------------------------------------
     def _save(self, body: bytes, suggested: str, ts: Optional[float],
@@ -93,53 +108,89 @@ class Reassembler:
             self.pending_mp4 = None
         self._meta.pop(path, None)
 
-    # -- finalisation ------------------------------------------------------
+    # -- completion (verification is deferred + parallelised) --------------
     def _finalize(self, path: Optional[str]) -> None:
+        """Record a completed reassembled file; verification happens later."""
         if not path or not os.path.exists(path):
             if path:
                 self._clear(path)
             return
-        meta = self._meta.get(path, {})
-        result = self.verifier.verify(path)
-        self._classify(path, meta, result)
+        self.completed.append({"path": path, "meta": dict(self._meta.get(path, {})), "owns": True})
         self._clear(path)
 
-    def _classify(self, path: str, meta: dict, result: MatchResult) -> None:
-        origname = packaging.sanitize_filename(meta.get("suggested") or os.path.basename(path))
+    def register_loose(self, path: str, ts: Optional[float]) -> None:
+        """Register a loose backup video file for verification (copied, never moved)."""
+        self.completed.append({
+            "path": path,
+            "meta": {"suggested": os.path.basename(path), "ts": ts},
+            "owns": False,
+        })
+
+    def verify_all(self, jobs: int = 1) -> None:
+        """Verify every completed candidate (in parallel) and file the results."""
+        items = self.completed
+        self.completed = []
+        if not items:
+            return
+        paths = [it["path"] for it in items]
+        if jobs and jobs > 1 and len(paths) > 1:
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                results = list(ex.map(self.verifier.verify, paths))
+        else:
+            results = [self.verifier.verify(p) for p in paths]
+        # Classification (file moves/copies, naming) is done sequentially to
+        # keep free_name() and the stats counters race-free.
+        for it, result in zip(items, results):
+            self._classify(it, result)
+
+    def _classify(self, item: dict, result: MatchResult) -> None:
+        path, meta, owns = item["path"], item["meta"], item["owns"]
+        if not os.path.exists(path):
+            return
+        suggested = meta.get("suggested") or os.path.basename(path)
+        if not owns:  # loose file: give it the detected container extension
+            suggested = ensure_ext(suggested, magic.extension_for(_sniff(path)))
+        origname = packaging.sanitize_filename(suggested)
+
         if result.status == "verified":
-            newname = packaging.free_name(self.verified, f"{result.title}{SEP_MARK}{origname}")
-            self._move(path, os.path.join(self.verified, newname))
+            self._place(item, self.verified, f"{result.title}{SEP_MARK}{origname}")
             self.stats["verified"] += 1
             log.info("VERIFIED: %s", result.title)
         elif result.status == "likely":
-            newname = packaging.free_name(self.unverified, f"{result.title}{LIKELY_MARK}{origname}")
-            self._move(path, os.path.join(self.unverified, newname))
+            self._place(item, self.unverified, f"{result.title}{LIKELY_MARK}{origname}")
             self.stats["likely"] += 1
             log.info("likely: %s", result.title)
         elif result.status == "unverified":
-            newname = packaging.free_name(self.unverified, f"{result.title}{SEP_MARK}{origname}")
-            self._move(path, os.path.join(self.unverified, newname))
+            self._place(item, self.unverified, f"{result.title}{SEP_MARK}{origname}")
             self.stats["unverified"] += 1
             log.info("unverified: %s", result.title)
         else:  # discard
             if self.keep_all:
+                self._place(item, self.unverified, origname)
                 self.stats["unverified"] += 1
-            else:
+            elif owns:
                 try:
                     os.remove(path)
                 except OSError:
                     pass
                 self.stats["discarded"] += 1
+            else:
+                self.stats["discarded"] += 1  # leave the loose backup file alone
 
-    def _move(self, src: str, dst: str) -> None:
-        meta = self._meta.get(src, {})
+    def _place(self, item: dict, folder: str, base: str) -> None:
+        """Move (owned) or copy (loose) a candidate into ``folder`` as ``base``."""
+        src, ts, owns = item["path"], item["meta"].get("ts"), item["owns"]
+        dst = os.path.join(folder, packaging.free_name(folder, base))
         try:
-            os.replace(src, dst)
+            if owns:
+                os.replace(src, dst)
+            else:
+                shutil.copy2(src, dst)
         except OSError as exc:
-            log.debug("move %s -> %s failed: %s", src, dst, exc)
+            log.debug("place %s -> %s failed: %s", src, dst, exc)
             return
-        if meta.get("ts"):
-            packaging.set_mtime(dst, meta["ts"])
+        if ts:
+            packaging.set_mtime(dst, ts)
 
     # -- the feed ----------------------------------------------------------
     def feed(self, body: bytes, url: str, suggested: str, ts: Optional[float]) -> None:

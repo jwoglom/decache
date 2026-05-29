@@ -21,12 +21,20 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from .database import Database, VideoRecord, clean_title
 
 log = logging.getLogger("decache.verify")
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 # History-window thresholds (seconds), matching date_to_unix.vbs.
 CONFIRM_WINDOW = 3600 * 1.5          # 1.5 h  -> rating 1
@@ -80,19 +88,26 @@ class Verifier:
         """
         if not target_hashes:
             return set()
-        raw_path = os.path.join(self.workdir, "frames.raw")
+        # A unique temp file per call so concurrent verifications don't clobber
+        # each other's frames (this method runs in a thread pool).
         try:
-            if os.path.exists(raw_path):
-                os.remove(raw_path)
+            fd, raw_path = tempfile.mkstemp(suffix=".raw", dir=self.workdir)
+            os.close(fd)
+        except OSError:
+            fd, raw_path = tempfile.mkstemp(suffix=".raw")
+            os.close(fd)
+        try:
             subprocess.run(
-                [self.ffmpeg, "-i", path, "-vf", "scale=32:32",
+                [self.ffmpeg, "-y", "-i", path, "-vf", "scale=32:32",
                  "-pix_fmt", "gray", "-f", "rawvideo", raw_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=300)
         except (OSError, subprocess.TimeoutExpired) as exc:
             log.debug("ffmpeg frame extraction failed for %s: %s", path, exc)
+            _safe_remove(raw_path)
             return set()
-        if not os.path.exists(raw_path):
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            _safe_remove(raw_path)
             return set()
         try:
             proc = subprocess.run([self.phash, raw_path, *target_hashes],
@@ -102,10 +117,7 @@ class Verifier:
             log.debug("phash failed for %s: %s", path, exc)
             return set()
         finally:
-            try:
-                os.remove(raw_path)
-            except OSError:
-                pass
+            _safe_remove(raw_path)
         matched = set()
         for line in proc.stdout.decode("ascii", "replace").splitlines():
             tok = line.split()

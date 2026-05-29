@@ -47,6 +47,8 @@ Options:
 | `--keep-all` | Save all candidate videos to `Unverified`, even unmatched ones. |
 | `--silence 1` | Ignore all errors; make no interactive prompts. |
 | `--silence 2` | Like `1`, but still attempt one ownership/permission recovery. |
+| `-j` / `--jobs N` | Parallel workers for cache parsing and ffmpeg/phash verification (default: number of CPUs; `1` = serial). |
+| `--dump-urls FILE` | Write every cache URL the parsers extracted to `FILE` (debugging). |
 | `-v` / `-vv` | Verbose / debug logging. |
 
 The legacy Windows-style switches `/keepall` and `/silence:N` are still accepted
@@ -73,7 +75,12 @@ to review.
    - YouTube `videoplayback` URLs whose `o-…` asset id was learned by reading the
      cached watch pages for the ids in `watch_page_data.txt`;
    - files whose name matches a `unique_names.txt` glob (e.g. `*.swf`).
-4. **Verify the rest** — for video files *not* matched by the index, identify the
+4. **Loose-file scan** (port of the original's Temp globbing) — stray media that
+   isn't inside a recognised cache is also picked up: `fla*.tmp` / `get_video*` /
+   `videoplayback*` and `unique_names.txt` globs anywhere, plus broad
+   `*.flv`/`*.mp4`/`*.webm`/`*.on2` only inside temp-like directories (so a user's
+   media library isn't swept up). These files are **copied**, never moved.
+5. **Verify the rest** — for video files *not* matched by the index, identify the
    container by magic bytes (FLV / MP4 / WebM), then:
    - measure the duration with ffmpeg and narrow the database to records with a
      matching duration range;
@@ -82,7 +89,10 @@ to review.
    - otherwise correlate the video id against the user's browser history: a
      visit within ~1.5 h of the file's timestamp (and unique) → **verified**;
      within ~12.5 h → **unverified** for manual review.
-5. **Package** — zip the verified findings into `Assets.zip`.
+
+   Cache parsing, history parsing, and this verification step run across
+   `--jobs` workers (default: all CPUs).
+6. **Package** — zip the verified findings into `Assets.zip`.
 
 ## Project layout
 
@@ -107,7 +117,7 @@ lib/               the Python implementation
   verify.py          ffmpeg + phash + duration/history matching
   packaging.py       filenames, mtime preservation, zipping
   ui.py              CLI prompts (replace the old VBScript dialogs)
-tests/             integration + recovery smoke tests
+tests/             integration, recovery, and loose-scan smoke tests
 ```
 
 ## Migrating from the Windows version

@@ -25,6 +25,7 @@ import argparse
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 from lib import scanner
@@ -41,30 +42,48 @@ log = logging.getLogger("decache")
 
 
 def scan_target(target: str, db: Database, paths: Paths, tools: Tools,
-                keep_all: bool, recoverer: "Recoverer") -> Recoverer:
+                keep_all: bool, recoverer: "Recoverer", jobs: int = 1) -> Recoverer:
     """Scan one target: discover caches, build history, run index-driven recovery.
 
     A single ``Recoverer`` is shared across every scanned target so the asset
     numbering (``[N]``), ``contents.txt`` manifest, and cached-id set stay
-    continuous for the whole run.
+    continuous for the whole run.  ``jobs`` parallelises cache parsing and the
+    (ffmpeg/phash) verification pass.
     """
     log.info("scanning %s", target)
-    locations, history_files = scanner.discover(target)
+    # Loose-file globs: specific patterns are matched anywhere; broad video
+    # extensions only inside temp-like dirs (so a media library isn't swept up).
+    loose_anywhere = ["fla*.tmp", "get_video*", "videoplayback*"] + list(db.unique_globs)
+    loose_temp = ["*.flv", "*.on2", "*.webm", "*.mp4"]
+    locations, history_files, loose_files = scanner.discover(target, loose_anywhere, loose_temp)
 
-    # Build the history index (video id -> visit timestamps) for the
-    # unindexed-video correlation step.
-    visits = []
-    for hf in history_files:
-        visits.extend(history_mod.parse_history_file(hf))
+    # Build the history index (video id -> visit timestamps), parsing the DBs
+    # in parallel (each parse is independent and mostly I/O).
+    if jobs > 1 and len(history_files) > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            visit_lists = list(ex.map(history_mod.parse_history_file, history_files))
+    else:
+        visit_lists = [history_mod.parse_history_file(hf) for hf in history_files]
+    visits = [v for lst in visit_lists for v in lst]
     history_index = build_history_index(visits)
     log.info("history: %d visits across %d ids", len(visits), len(history_index))
     recoverer.verifier.history = history_index
 
-    for loc in locations:
-        entries = list(scanner.parse_location(loc))
+    # Parse cache locations in parallel (decompression releases the GIL), then
+    # feed them sequentially so reassembly ordering / shared counters stay safe.
+    if jobs > 1 and len(locations) > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            parsed = list(ex.map(lambda loc: (loc, list(scanner.parse_location(loc))), locations))
+    else:
+        parsed = [(loc, list(scanner.parse_location(loc))) for loc in locations]
+    for loc, entries in parsed:
         recoverer.process_location(entries, label=f"[{loc.family}] {loc.path}")
 
-    recoverer.flush()
+    # Loose files outside any recognised cache (e.g. fla*.tmp in Temp).
+    for lf in loose_files:
+        recoverer.process_loose_file(lf)
+
+    recoverer.flush(jobs)
     return recoverer
 
 
@@ -226,6 +245,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dump-urls", metavar="FILE",
                         help="write every cache URL seen to FILE (for debugging "
                         "what the parsers actually extracted)")
+    parser.add_argument("-j", "--jobs", type=int, default=0,
+                        help="parallel workers for cache parsing and ffmpeg/phash "
+                        "verification (default: number of CPUs; 1 = serial)")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     args = parser.parse_args(argv)
 
@@ -265,9 +287,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                           args.keep_all)
     if args.dump_urls:
         recoverer.dump_fh = open(args.dump_urls, "w", encoding="utf-8", errors="replace")
+    jobs = args.jobs if args.jobs and args.jobs > 0 else (os.cpu_count() or 1)
+    log.info("using %d parallel worker(s)", jobs)
     try:
         for target in targets:
-            scan_target(target, db, paths, tools, args.keep_all, recoverer)
+            scan_target(target, db, paths, tools, args.keep_all, recoverer, jobs)
     finally:
         if recoverer.dump_fh is not None:
             recoverer.dump_fh.close()

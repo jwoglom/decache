@@ -10,9 +10,11 @@ logged, and never abort the scan.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
-from typing import Callable, Dict, Iterator, List, Tuple
+import re
+from typing import Callable, Dict, Iterator, List, Optional, Pattern, Tuple
 
 from . import chromium_cache, firefox_cache, ie_cache, opera_cache
 from .cache_common import CacheEntry, CacheLocation
@@ -42,10 +44,38 @@ def _on_walk_error(exc: OSError) -> None:
     log.debug("skipping unreadable path: %s", exc)
 
 
-def discover(root: str) -> Tuple[List[CacheLocation], List[str]]:
-    """Walk ``root`` and return (cache locations, history file paths)."""
+def _compile_globs(globs) -> Optional[Pattern]:
+    """Combine fnmatch globs into one case-insensitive regex (or None)."""
+    globs = [g for g in globs if g]
+    if not globs:
+        return None
+    return re.compile("|".join(fnmatch.translate(g.lower()) for g in globs))
+
+
+def _is_temp_dir(dirpath: str) -> bool:
+    """Temp-like directory (where the original loose-scanned for fla*.tmp)."""
+    low = dirpath.lower().replace("\\", "/")
+    base = os.path.basename(low.rstrip("/"))
+    return base in ("temp", "tmp") or "temporary internet files" in low
+
+
+def discover(root: str, loose_globs_anywhere=(), loose_globs_temp=()
+             ) -> Tuple[List[CacheLocation], List[str], List[str]]:
+    """Walk ``root`` once and return (cache locations, history files, loose files).
+
+    ``loose_globs_anywhere`` are filename patterns specific enough to match
+    safely anywhere on the tree (e.g. ``fla*.tmp``, ``get_video*``).
+    ``loose_globs_temp`` are broad patterns (``*.mp4`` ...) only matched inside
+    temp-like directories, so a user's media library isn't swept up.  Matching
+    is pure string work on names os.walk already lists, so it adds negligible
+    cost to the walk.
+    """
     locations: List[CacheLocation] = []
     history_files: List[str] = []
+    loose_files: List[str] = []
+
+    any_re = _compile_globs(loose_globs_anywhere)
+    temp_re = _compile_globs(loose_globs_temp)
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_on_walk_error):
         # Collect history databases living in this directory.
@@ -67,14 +97,25 @@ def discover(root: str) -> Tuple[List[CacheLocation], List[str]]:
             # Don't descend into a recognised cache root; its internals
             # (entries/, data_*, Content.IE5/...) belong to this backend.
             dirnames[:] = []
+            continue
 
-    log.info("found %d cache location(s) and %d history file(s)",
-             len(locations), len(history_files))
+        # Loose-file scan (files NOT inside a recognised cache).
+        if any_re is not None or temp_re is not None:
+            in_temp = temp_re is not None and _is_temp_dir(dirpath)
+            for name in filenames:
+                low = name.lower()
+                if (any_re is not None and any_re.match(low)) or (in_temp and temp_re.match(low)):
+                    loose_files.append(os.path.join(dirpath, name))
+
+    log.info("found %d cache location(s), %d history file(s), %d loose file(s)",
+             len(locations), len(history_files), len(loose_files))
     for loc in locations:
         log.info("  cache [%s]: %s", loc.family, loc.path)
     for hf in history_files:
         log.info("  history: %s", hf)
-    return locations, history_files
+    for lf in loose_files:
+        log.info("  loose: %s", lf)
+    return locations, history_files, loose_files
 
 
 _PARSERS: Dict[str, Callable[[str], Iterator[CacheEntry]]] = {

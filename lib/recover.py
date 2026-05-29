@@ -38,7 +38,9 @@ import os
 import re
 from typing import Dict, List, Optional, Set
 
-from . import packaging
+import shutil
+
+from . import magic, packaging
 from .cache_common import CacheEntry
 from .database import Database
 from .reassemble import Reassembler, suggested_name
@@ -213,7 +215,6 @@ class Recoverer:
             body = entry.read_bytes()
             if not body:
                 continue
-            from . import magic
             kind = magic.classify(body)
             is_video = (kind is not magic.Kind.OTHER
                         or bool(re.search(r"/(?:watch|videoplayback|get_video)\?", url, re.I)))
@@ -226,8 +227,65 @@ class Recoverer:
         log.info("  %s: %d entries, %d video candidate(s), %d asset(s) recovered",
                  label or "location", n_entries, n_video, n_asset)
 
-    def flush(self) -> None:
+    # -- loose files (outside any recognised cache) ------------------------
+    def process_loose_file(self, path: str) -> None:
+        """Handle a stray on-disk media file (fla*.tmp, loose .flv/.mp4, ...).
+
+        The backup is never modified: matched files are *copied* into
+        Verified/Unverified, mirroring read_cache.bat's :unusedCheck path.
+        """
+        name = os.path.basename(path)
+        low = name.lower()
+        self.totals["entries"] += 1
+
+        # Unique-name asset (e.g. mainpage_final*.swf) -> recover directly.
+        import fnmatch
+        if any(fnmatch.fnmatch(low, g.lower()) for g in self.db.unique_globs):
+            self._recover_asset_from_path(path, name)
+            self.totals["assets"] += 1
+            return
+
+        # Otherwise an unindexed video candidate: sniff header, verify in place.
+        try:
+            with open(path, "rb") as fh:
+                header = fh.read(magic.HEADER_BYTES)
+        except OSError as exc:
+            log.debug("cannot read loose file %s: %s", path, exc)
+            return
+        kind = magic.classify(header)
+        is_video = (kind is not magic.Kind.OTHER
+                    or low.endswith((".flv", ".webm", ".mp4", ".on2"))
+                    or low.startswith(("get_video", "videoplayback", "fla")))
+        if not is_video:
+            return
+        self.totals["video_candidates"] += 1
+        # Defer to the shared (parallel) verification pass; loose backup files
+        # are copied, never moved.
+        try:
+            ts = os.path.getmtime(path)
+        except OSError:
+            ts = None
+        self.reasm.register_loose(path, ts)
+
+    def _recover_asset_from_path(self, path: str, name: str) -> None:
+        self.file_count += 1
+        n = self.file_count
+        out_name = packaging.free_name(self.verified, packaging.sanitize_filename(f"[{n}]{name}"))
+        out_path = os.path.join(self.verified, out_name)
+        try:
+            shutil.copy2(path, out_path)
+        except OSError as exc:
+            log.debug("could not copy loose asset %s: %s", path, exc)
+            self.file_count -= 1
+            return
+        self._append_line(self.contents_path, f'"{n} {path}"')
+        self._append_line(self.private_locations_path, f'"{n} {path}"')
+        log.info("recovered loose asset [%d] %s", n, name)
+
+    def flush(self, jobs: int = 1) -> None:
+        """Finalise pending chunks, then verify all candidates (parallel)."""
         self.reasm.flush()
+        self.reasm.verify_all(jobs)
 
     @property
     def stats(self) -> dict:
