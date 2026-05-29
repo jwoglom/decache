@@ -63,7 +63,8 @@ class Verifier:
     def get_duration(self, path: str) -> Optional[float]:
         """Measured duration in seconds, or None if ffmpeg can't read it."""
         try:
-            proc = subprocess.run([self.ffmpeg, "-i", path],
+            proc = subprocess.run([self.ffmpeg, "-nostdin", "-i", path],
+                                  stdin=subprocess.DEVNULL,
                                   stdout=subprocess.DEVNULL,
                                   stderr=subprocess.PIPE, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -98,8 +99,9 @@ class Verifier:
             os.close(fd)
         try:
             subprocess.run(
-                [self.ffmpeg, "-y", "-i", path, "-vf", "scale=32:32",
+                [self.ffmpeg, "-nostdin", "-y", "-i", path, "-vf", "scale=32:32",
                  "-pix_fmt", "gray", "-f", "rawvideo", raw_path],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=300)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -111,6 +113,7 @@ class Verifier:
             return set()
         try:
             proc = subprocess.run([self.phash, raw_path, *target_hashes],
+                                  stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, timeout=300)
         except (OSError, subprocess.TimeoutExpired) as exc:
